@@ -137,6 +137,7 @@ The options are presented below:
 | NETWORK   | network name (alias)- is used for connecting via ipc (see block processor section)
 | SYNC_SHADOW   | sync blocks in background
 | PROVIDERS   | 'the path to node rest api'@'the path to node websocket'
+| CONSENSUS_BLOCK_VALIDATE_AMOUNT | the amount of blocks to consensus
 
 License
 ----
