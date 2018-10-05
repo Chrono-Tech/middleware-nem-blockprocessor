@@ -17,8 +17,12 @@ const config = require('./config'),
   _ = require('lodash'),
   bunyan = require('bunyan'),
   amqp = require('amqplib'),
+  AmqpService = require('middleware_common_infrastructure/AmqpService'),
+  InfrastructureInfo = require('middleware_common_infrastructure/InfrastructureInfo'),
+  InfrastructureService = require('middleware_common_infrastructure/InfrastructureService'),
+  
   models = require('./models'),
-  log = bunyan.createLogger({name: 'nem-blockprocessor'}),
+  log = bunyan.createLogger({name: 'core.blockProcessor', level: config.logs.level}),
   MasterNodeService = require('middleware-common-components/services/blockProcessor/MasterNodeService'),
   BlockWatchingService = require('./services/blockWatchingService'),
   SyncCacheService = require('./services/syncCacheService'),
@@ -29,7 +33,27 @@ mongoose.Promise = Promise; // Use custom Promises
 mongoose.connect(config.mongo.data.uri, {useMongoClient: true});
 mongoose.accounts = mongoose.createConnection(config.mongo.accounts.uri);
 
+const runSystem = async function () {
+  const rabbit = new AmqpService(
+    config.systemRabbit.url, 
+    config.systemRabbit.exchange,
+    config.systemRabbit.serviceName
+  );
+  const info = new InfrastructureInfo(require('./package.json'));
+  const system = new InfrastructureService(info, rabbit, {checkInterval: 10000});
+  await system.start();
+  system.on(system.REQUIREMENT_ERROR, ({requirement, version}) => {
+    log.error(`Not found requirement with name ${requirement.name} version=${requirement.version}.` +
+        ` Last version of this middleware=${version}`);
+    process.exit(1);
+  });
+  await system.checkRequirements();
+  system.periodicallyCheck();
+};
+
 const init = async () => {
+  if (config.checkSystem)
+    await runSystem();
 
 
   [mongoose.accounts, mongoose.connection].forEach(connection =>
@@ -40,6 +64,8 @@ const init = async () => {
 
   models.init();
 
+  if (config.checkSystem)
+    await runSystem();
 
   let amqpInstance = await amqp.connect(config.rabbit.url);
 
@@ -51,14 +77,14 @@ const init = async () => {
 
   await channel.assertExchange('events', 'topic', {durable: false});
   await channel.assertExchange('internal', 'topic', {durable: false});
-  await channel.assertQueue(`${config.rabbit.serviceName}_current_provider.get`, {durable: false});
+  await channel.assertQueue(`${config.rabbit.serviceName}_current_provider.get`, {durable: false, autoDelete: true});
   await channel.bindQueue(`${config.rabbit.serviceName}_current_provider.get`, 'internal', `${config.rabbit.serviceName}_current_provider.get`);
 
 
   const masterNodeService = new MasterNodeService(channel, config.rabbit.serviceName);
   await masterNodeService.start();
 
-  providerService.events.on('provider_set', providerURI => {
+  providerService.on('provider_set', providerURI => {
     let providerIndex = _.findIndex(config.node.providers, providerURI);
     if (providerIndex !== -1)
       channel.publish('internal', `${config.rabbit.serviceName}_current_provider.set`, new Buffer(JSON.stringify({index: providerIndex})));
@@ -76,6 +102,7 @@ const init = async () => {
 
   let blockEventCallback = async block => {
     log.info(`${block.hash} (${block.number}) added to cache.`);
+    await channel.publish('events', `${config.rabbit.serviceName}_block`, new Buffer(JSON.stringify({block: block.number})));
     let filtered = await filterTxsByAccountsService(block.txs);
     await Promise.all(filtered.map(item =>
       channel.publish('events', `${config.rabbit.serviceName}_transaction.${item.address}`, new Buffer(JSON.stringify(Object.assign(item))))
@@ -90,7 +117,7 @@ const init = async () => {
   };
 
 
-  syncCacheService.events.on('block', blockEventCallback);
+  syncCacheService.on('block', blockEventCallback);
 
   let endBlock = await syncCacheService.start();
 
@@ -98,15 +125,15 @@ const init = async () => {
     if (config.sync.shadow)
       return res();
 
-    syncCacheService.events.on('end', () => {
+    syncCacheService.on('end', () => {
       log.info(`cached the whole blockchain up to block: ${endBlock}`);
       res();
     });
   });
 
   const blockWatchingService = new BlockWatchingService(endBlock);
-  blockWatchingService.events.on('block', blockEventCallback);
-  blockWatchingService.events.on('tx', txEventCallback);
+  blockWatchingService.on('block', blockEventCallback);
+  blockWatchingService.on('tx', txEventCallback);
 
   await blockWatchingService.startSync();
 
